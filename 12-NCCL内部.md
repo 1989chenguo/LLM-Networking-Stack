@@ -28,7 +28,7 @@ NCCL_MIN_NCHANNELS=4 NCCL_MAX_NCHANNELS=4 \
 
 ---
 
-## 一、进门之后：一次 ncclAllReduce 在 NCCL 里走哪几步
+## 一、进门之后：从建组到执行，一次 all_reduce 走哪几步
 
 先看入口本身。`ncclAllReduce` 的函数体出乎意料地短（`src/collectives.cc`，NCCL 2.27，NVTX 打点已删去）：
 
@@ -43,24 +43,43 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
 }
 ```
 
-第 3 篇列过的那张参数表，在这里原样装进一个 `ncclInfo` 结构体，然后交给 `ncclEnqueueCheck`（`src/enqueue.cc`）。顾名思义，这个函数做的是**入队**：把这次调用登记成 communicator 规划器（planner）里的一条任务。之后 NCCL 的流程分两段：
+第 3 篇列过的那张参数表，在这里原样装进一个 `ncclInfo` 结构体，然后交给 `ncclEnqueueCheck`（`src/enqueue.cc`）——这是“进门”的第一步。但在跟着它往里走之前，先把全程的总图摆出来：从建组到结果落进张量，一次 all_reduce 牵涉的工作分属**三个时机**，本篇的内容就按这三个时机组织。
 
-- **规划**：对每条任务，按消息大小选定算法、协议、channel 数和线程数（本篇第三、四、五节），组装成一个 kernel 计划（`ncclKernelPlan`）；
-- **发射**：`ncclLaunchKernel` 把计划变成一次 `cuLaunchKernelEx`——就是第 3 篇 profiler 里那个 `ncclDevKernel_AllReduce_Sum_f32_RING_LL` 被排进队列的瞬间。
-
-如果调用方用了 `ncclGroupStart/ncclGroupEnd`，规划会推迟到 group 结束时统一进行，一组任务可以合并发射——c10d 每次只登记一条任务，所以对它而言"入队、规划、发射"在一次 `ncclAllReduce` 调用内依次完成。group 的合并能力是 send/recv 路径的主角，下一篇讲。
-
-把视角再拉远一层：从建组到执行，`ncclAllReduce` 牵涉的工作分属三个时机，本篇的内容就按这三个时机组织：
+```text
+建组时（每个组一次）  拓扑探测、环/树搜索、调优表计算、连接与缓冲建立
+      │  产物全部固化进 communicator，供之后每次调用查用
+      ▼
+调用时（每次调用）    入队 → 规划 → 发射：CPU 上把这次调用变成一个 kernel
+      ▼
+执行时（GPU 排到队）  kernel 沿环或沿树逐跳搬运并规约，结果落进输出张量
+```
 
 | 时机 | 发生时刻 | 干什么 | 结果存在哪 |
 | --- | --- | --- | --- |
 | 建组时 | 第一次使用这个组（第 3 篇的懒初始化） | 拓扑探测、环/树搜索、调优表计算、连接与缓冲建立 | communicator 内部（篇 11 说的通信子） |
-| 调用时 | 每次 `ncclAllReduce` | 按消息大小查表，选算法、协议、channel 数、线程数 | kernel 计划与任务结构 |
+| 调用时 | 每次 `ncclAllReduce` | 入队、规划、发射：按消息大小查表选方案，组装并发射 kernel 计划 | kernel 计划与任务结构 |
 | 执行时 | GPU 按队列排到 | kernel 沿环或沿树逐跳搬运并规约 | 你的输出张量 |
 
-关键的分工是：**与"这次消息多大"无关的决策，全部在建组时固化；与消息大小有关的决策，留在调用时查表。**建组的那几百毫秒（第 3 篇实验一）买的是前者——拓扑要探测、环要搜索、连接要建立，每件都是全组协调的重活，不可能每次通信重做；调用时剩下的工作只有"量一下消息大小，查一次表"，开销在微秒级。第二节看建组时固化了什么，第三到第五节看调用时查的是什么表、执行时 kernel 怎么跑。
+先交代第一格的身份：**建组不发生在 `ncclAllReduce` 里面。**它走的是另一组 API：上一篇十二步的第③步，`getNCCLComm` 按（组、卡）查表，没建过才调 `initNCCLComm`，后者再进 NCCL 的 `ncclCommInitRank`——c10d 的懒初始化（第 3 篇的那几百毫秒）就花在这里；上一篇停在 `fn(inputs[0], outputs[0], comm, ncclStream)` 上，括号里的 `comm` 正是这一步的产物。所以三个时机不是“ncclAllReduce 内部的三步”，而是一次 all_reduce“从准备到完成”的全程——建组一次，调用很多次，执行在 GPU。
+
+总图有了，再逐格放大。这里要读的是中间这一格——每次 `ncclAllReduce` 调用在 CPU 上做的三件事：
+
+- **入队**：就是上面那句 `ncclEnqueueCheck`——把这次调用登记成 communicator 规划器（planner）里的一条任务；
+- **规划**：对每条任务，按消息大小选定算法、协议、channel 数和线程数（本篇第三、四、五节），组装成一个 kernel 计划（`ncclKernelPlan`）；
+- **发射**：`ncclLaunchKernel` 把计划变成一次 `cuLaunchKernelEx`——就是第 3 篇 profiler 里那个 `ncclDevKernel_AllReduce_Sum_f32_RING_LL` 被排进队列的瞬间。
+
+如果调用方用了 `ncclGroupStart/ncclGroupEnd`，规划会推迟到 group 结束时统一进行，一组任务可以合并发射——c10d 每次只登记一条任务，所以对它而言“入队、规划、发射”在一次 `ncclAllReduce` 调用内依次完成。group 的合并能力是 send/recv 路径的主角，下一篇讲。
+
+最后交代三个时机为什么这么切。关键的分工是：**与“这次消息多大”无关的决策，全部在建组时固化；与消息大小有关的决策，留在调用时查表。**建组的那几百毫秒（第 3 篇实验一）买的是前者——拓扑要探测、环要搜索、连接要建立，每件都是全组协调的重活，不可能每次通信重做；调用时剩下的工作只有“量一下消息大小，查一次表”，开销在微秒级。第二节看建组时固化了什么，第三到第五节看调用时查的是什么表、执行时 kernel 怎么跑。
 
 ## 二、建组时：拓扑、搜索与连接
+
+建组在前几篇都露过面，先花半分钟对齐各自讲到了哪一层——本节和它们是同一件事的几种粒度：
+
+- **第 3 篇**给出三步概括：发钥匙（c10d 发 uniqueId）、入会（`ncclCommInitRank` 拉起 bootstrap socket）、选路（拓扑探测并排环），回答的是“第一次为什么慢”；
+- **第 4、5 篇**把选路判决书上的两种通路拆到底：`via P2P/IPC`（CUDA IPC 显存映射）与跨机的 QP、注册内存，是“施工”在机内、跨机两个方向的细节；
+- **篇 11** 在 c10d 十二步里定位了触发点与产物：`getNCCLComm` → `initNCCLComm`，懒初始化、每（组、卡）一次，`comm` 就是这么来的；
+- **本篇**不再重复发钥匙与入会，只把三步里的“选路”打开成 `initTransportsRank` 实际做的五步——本节是它的显微镜；篇 4、5 读过的施工细节，收进第⑤步一笔带过。
 
 ### 2.1 建组的五步，先用小例子走一遍
 
