@@ -382,23 +382,31 @@ rank 4
 // all_reduce.h（NCCL 2.27，有删节）
 // 每张卡各跑一份；ringIx 是本卡在环上的序号；channelCount 是本 channel 分到的元素数
 // prims 是"收发原语"对象，directXxx 一组方法表示机内直连（第 4 篇的显存直写）
+// offset(chunk) = elemOffset + chunk × 每块元素数——第 chunk 块在缓冲里的起点；nelem = 本块元素数
+// 复合原语带两个 offset：输入缓冲里这块的位置、输出缓冲里这块的位置（原地操作，二者相同）
 for (elemOffset = 0; elemOffset < channelCount; elemOffset += loopCount) {
   // ── 第一个半程：reduce-scatter，共 p-1 步 ──
   chunk = modRanks(ringIx - 1);
   prims.directSend(offset(chunk), nelem);            // 第 0 步：把指定块发给下一家
   for (j = 2; j < nranks; ++j) {                     // 中间 p-2 步：
-    chunk = modRanks(ringIx - j);
-    prims.directRecvReduceDirectSend(...);           //   收一块 → 与本地对应块规约 → 转发
+    chunk = modRanks(ringIx - j);                    //   每步换一块：编号随 j 往前倒一格
+    // 收一块部分和 → 与本地对应块规约 → 转发
+    prims.directRecvReduceDirectSend(offset(chunk), offset(chunk), nelem);
   }
   chunk = ringIx;
-  prims.directRecvReduceCopyDirectSend(..., postOp); // 第 p-1 步：最后一块规约到位，
-                                                     //   写入本卡输出缓冲，同时转发给下一家
+  // 第 p-1 步：最后一块规约到位，写入本卡输出缓冲，同时转发给下一家——这一发就是下半程的第一棒
+  prims.directRecvReduceCopyDirectSend(offset(chunk), offset(chunk), nelem, postOp);
 
   // ── 第二个半程：all-gather，共 p-1 步 ──
+  // 环上流的都是加完的总和，动词从 Reduce 变 Copy——抄一份留底，原样接力
   for (j = 1; j < nranks - 1; ++j) {                 // 中间 p-2 步：
-    prims.directRecvCopyDirectSend(...);             //   收结果块 → 抄进输出缓冲 → 转发
+    chunk = modRanks(ringIx - j);                    //   与上半程同一节奏：每圈倒一格
+    // 收结果块（加完的总和） → 抄进输出缓冲 → 原样转发
+    prims.directRecvCopyDirectSend(offset(chunk), offset(chunk), nelem);
   }
-  prims.directRecv(...);                             // 第 2p-2 步：收齐最后一块
+  chunk = modRanks(ringIx + 1);                      // 最后到齐的是"下一家产地"的那块
+  // 第 2p-2 步：收齐最后一块——下一家就是这块的产地，只收不发
+  prims.directRecv(offset(chunk), nelem);
 }
 ```
 
