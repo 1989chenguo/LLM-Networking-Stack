@@ -799,11 +799,21 @@ struct alignas(16) ncclDevWorkColl {
 
 切分方式是**连续字节切分**：消息按字节排成一条线，channel 0 拿第一段、channel 1 拿第二段……（首尾的 channel 允许与中间不等长，以凑齐对齐）。每条 channel 内部再按环切成 p 个 chunk，走 3.1 节那两个半程。两层切分叠起来：先按 channel 分、再按 rank 分。
 
-这套"各拿各段"在代码里分两处落地，而且**没有任何地方把 channel 指派给具体的 SM**——块落到哪个 SM 是硬件调度器的事，NCCL 只认块的编号，让每个块自报家门、按号取活。两环推导：
+这套"各拿各段"在代码里怎么落地？先立一句总纲：**CPU 给 GPU 的从来不是分工结果，而是分工规则——一个位图加一张任务单；每个块拿自己的编号套规则，现场算出"我是谁、干哪段"。**所以代码里没有任何地方把 channel 指派给具体的 SM：块落到哪个 SM 是硬件调度器的事，NCCL 完全不过问。规则就两条，对应两环推导。
 
-**第一环，块号 → channel 号**（`src/device/common.h`）：kernel 一进来，每个块在 `channelMask`（本次启用的 channel 位图）里找"第 `blockIdx.x` 个置 1 的位"，位序就是自己的 channel 号——grid 的块数恰是位图中 1 的个数（上面的 `countOneBits`），所以块号与启用的 channel 一一对应。
+**第一环，块号 → channel 号：channelId 不是传进来的参数，是每个块自己算出来的。**CPU 只随 kernel 参数给了一个 `channelMask`（本次启用的 channel 位图）。kernel 一开场，块内前 64 个线程各查一位：数出"我这位之前有几个 1"——即"这条 channel 是本次启用的第几条"；序号恰好等于本块编号 `blockIdx.x` 的那个线程，把结果写进块内共享内存，全块共用（`src/device/common.h`，有删节）：
 
-**第二环，channel 号 → 字节段**（`src/include/device.h` 的 `ncclCollCbdPart`，CPU、GPU 通用的同一个函数）：每个块拿自己的 channel 号与任务单的 `[channelLo, channelHi]` 一比，对号入座：
+```c
+// device/common.h（NCCL 2.27，有删节）：每个块认领自己的 channel
+if (tid < MAXCHANNELS && (args->channelMask & (1ull<<tid))) {
+  int n = __popcll(args->channelMask & ((1ull<<tid)-1));  // 第 tid 位之前有几个 1
+  if (blockIdx.x == n) ncclShmem.channelId = tid;         // 序号轮到我这个块：我是 channel tid
+}
+```
+
+grid 的块数恰是位图中 1 的个数——上面的 `countOneBits` 与这里的 `__popcll` 是同一个"数 1"操作在 CPU、GPU 两侧各自的名字：一个用来定"开几个块"，一个用来让每块认领"我是第几条"，两处严丝合缝。位图查找还天然支持 channel 号不连续：比如启用 0～3 与 8～11 共 8 条时，块 4 领到的是 channel 8。
+
+**第二环，channel 号 → 字节段：全体块共享同一张任务单，各代入各的编号。**一次调用只发射一个 kernel，这个 kernel 的所有块读到的 `ncclDevWorkColl` 内容完全相同——分工不靠"给每个块发不同的任务单"，而靠"同一份任务单 + 各自的 channelId"：`ncclCollCbdPart(work, channelId, ...)`（`src/include/device.h`，CPU、GPU 通用的同一个函数）的输入里，work 人人相同、channelId 各块不同，输出便各块不同。打个比方：work 是黑板上的同一张值日表，channelId 是各人的学号——不是每人发一张纸条，而是拿自己的学号查同一张表：
 
 ```c
 // include/device.h（NCCL 2.27，有删节）：channel 号 → 字节段
@@ -819,7 +829,7 @@ if (channelId == work->channelLo) {        // 首段：偏移 0，长 countLo
 }
 ```
 
-**三个 count 是谁算的**：`src/enqueue.cc` 的 `scheduleCollTasksToPlan`（3.5 节"规划"那一步）把消息按 cell（对齐到 16 字节倍数的单元）均分——中段等长、尾段拿余数；首段特殊还有第二个原因：同一 kernel 计划合并了多项任务时（第一节的 group 合批），第一条 channel 可能已背着前一项任务的流量，要少摊。
+**任务单本身是调用时现填的，不是建组时。**建组时固化的是 communicator——图纸、连接、缓冲、旗标、调优表；任务单依赖本次消息大小，只能每次调用现算：`src/enqueue.cc` 的 `scheduleCollTasksToPlan`（3.5 节"规划"那一步）把消息按 cell（对齐到 16 字节倍数的单元）均分，中段等长、尾段拿余数；首段特殊还有第二个原因——同一 kernel 计划合并了多项任务时（第一节的 group 合批），第一条 channel 可能已背着前一项任务的流量，要少摊。算好的 `channelLo/Hi` 与三个 count 随本次发射一起进 GPU、用完即弃——这是"三个时机"分工的又一次兑现。
 
 最后落回 3.1：`runRing` 一进来就调 `ncclCollCbdPart`，拿到本段起点 `gridOffset` 与段长 `channelCount`——3.1 那个 `offset(chunk)` 的完整版其实是 `gridOffset + elemOffset + chunkOffset`（当时为聚焦接力节奏，把 `gridOffset +` 删节掉了），外层循环的上界 `channelCount` 就是本 channel 的段长。
 
