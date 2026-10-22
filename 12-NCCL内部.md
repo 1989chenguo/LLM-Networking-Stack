@@ -763,6 +763,14 @@ lat_LL + S/bw_LL  =  lat_Simple + S/bw_Simple
 
 第二章走完了 channel 的第一幕：搜索时它是装走线表的编号槽位（2.1、2.3 节），折卡片、接线时它是图纸（2.4 节），建连时才照图建成连接与缓冲（2.5 节）。本节看第二幕完工后的形态，把定义补全：**槽位里的图纸已变成真家伙——一条 channel 是环（或树）的一份独立拷贝，连同它自己的连接、缓冲和旗标；数据被切成 channel 份，各条 channel 并行地沿各自的环搬运。**
 
+> **给没写过 CUDA 的读者**（写过 kernel 的可整框跳过）：本节两段代码只需三个背景词、两个语法点。
+> 
+> **三个词。**kernel 是在 GPU 上执行的函数——同一个函数由成千上万个线程同时跑，每个线程只处理数据的一小片；发射 kernel 时，CPU 一侧必须回答"一共多少线程、怎么编组"。编组分两层：若干线程打成一个**线程块（block）**，全部块合成一个**网格（grid）**，一次 kernel = 一个 grid；块是调度的最小单位，整体占一个 SM（流式多处理器，粗略当作 GPU 的一个"核"，A800 有一百多个）的一份档期，块与块之间互不通信、各跑各的。**warp** 是块内的打包单位：每 32 个线程捆成一组齐步走，512 线程即 16 个 warp。
+> 
+> **两个语法点。**其一，`dim3` 是 CUDA 的三维尺寸类型 `{x, y, z}`；NCCL 只用一维，y、z 恒为 1——`grid = {12, 1, 1}` 就是"12 个线程块一字排开"，`block = {512, 1, 1}` 就是"每块 512 线程"（花括号是 C 的初始化写法，`(unsigned)` 是类型转换，都是语法噪音）。其二，结构体里 `uint32_t channelLo:8` 的 `:8` 是 C 的位域语法——字段只占 8 位，三个 8 位字段挤在同一个 32 位字里（任务单要被每个块读，越小越省）；`size_t` 只是"表示字节数的无符号整数"，`alignas(16)` 是地址对齐的性能修饰，两者都可略过不究。
+> 
+> 带着这三词两点回读：`countOneBits(channelMask)` 在数"本次启用哪几条 channel"的位图里有几个 1；每个块运行时能读出自己的编号（`blockIdx.x`，0 到 nChannels−1），第 i 号块领第 i 条 channel；第二段代码的任务单（`ncclDevWorkColl`）里那三个 count，告诉它负责的字节段从哪开始、有多长。
+
 它在 kernel 发射处的体现只有一行（`enqueue.cc` 的 `ncclLaunchKernel`，有删节）：
 
 ```c
@@ -772,7 +780,7 @@ dim3 grid  = {(unsigned)nChannels, 1, 1};   // 一个线程块负责一条 chann
 dim3 block = {(unsigned)plan->threadPerBlock, 1, 1};
 ```
 
-一次集合通信发射的 kernel，其 grid 恰好是 channel 数个线程块——第 11 篇说"通信 kernel 只占很少几个线程块"，数量就是这里的 channel 数。块内线程数 `threadPerBlock` 按协议定：Simple 默认 512（ring 额外加一个 warp 负责同步），LL 为 512，LL128 为 640，上限 640（`NCCL_MAX_NTHREADS`）。每条 channel 占一个 SM 的一份线程块档期，SM 占用极少——这是第 7 篇通信与计算能够重叠的硬件基础。
+一次集合通信发射的 kernel，其 grid 恰好是 channel 数个线程块——第 11 篇说"通信 kernel 只占很少几个线程块"，数量就是这里的 channel 数。块内线程数 `threadPerBlock` 按协议定：Simple 默认 512（ring 额外加一个 warp 负责同步），LL 为 512，LL128 为 640，上限 640（`NCCL_MAX_NTHREADS`）。每条 channel 占一个 SM 的一份线程块档期——12 条 channel 不过 12 个块，对一百多个 SM 的机器只是零头——这是第 7 篇通信与计算能够重叠的硬件基础。
 
 任务结构里记着本次通信覆盖的 channel 区间和每条 channel 的字节数（`device.h`，有删节）：
 
@@ -791,7 +799,44 @@ struct alignas(16) ncclDevWorkColl {
 
 切分方式是**连续字节切分**：消息按字节排成一条线，channel 0 拿第一段、channel 1 拿第二段……（首尾的 channel 允许与中间不等长，以凑齐对齐）。每条 channel 内部再按环切成 p 个 chunk，走 3.1 节那两个半程。两层切分叠起来：先按 channel 分、再按 rank 分。
 
+这套"各拿各段"在代码里分两处落地，而且**没有任何地方把 channel 指派给具体的 SM**——块落到哪个 SM 是硬件调度器的事，NCCL 只认块的编号，让每个块自报家门、按号取活。两环推导：
+
+**第一环，块号 → channel 号**（`src/device/common.h`）：kernel 一进来，每个块在 `channelMask`（本次启用的 channel 位图）里找"第 `blockIdx.x` 个置 1 的位"，位序就是自己的 channel 号——grid 的块数恰是位图中 1 的个数（上面的 `countOneBits`），所以块号与启用的 channel 一一对应。
+
+**第二环，channel 号 → 字节段**（`src/include/device.h` 的 `ncclCollCbdPart`，CPU、GPU 通用的同一个函数）：每个块拿自己的 channel 号与任务单的 `[channelLo, channelHi]` 一比，对号入座：
+
+```c
+// include/device.h（NCCL 2.27，有删节）：channel 号 → 字节段
+if (channelId == work->channelLo) {        // 首段：偏移 0，长 countLo
+  *partOffset = 0;                  *partCount = work->cbd.countLo;
+} else if (channelId == work->channelHi) { // 尾段：拿余数
+  *partOffset = work->cbd.countLo + nMidChannels*work->cbd.countMid;
+  *partCount  = work->cbd.countHi;
+} else {                                   // 中段第 mid 段：等长
+  int mid = channelId - work->channelLo - 1;
+  *partOffset = work->cbd.countLo + mid*work->cbd.countMid;
+  *partCount  = work->cbd.countMid;
+}
+```
+
+**三个 count 是谁算的**：`src/enqueue.cc` 的 `scheduleCollTasksToPlan`（3.5 节"规划"那一步）把消息按 cell（对齐到 16 字节倍数的单元）均分——中段等长、尾段拿余数；首段特殊还有第二个原因：同一 kernel 计划合并了多项任务时（第一节的 group 合批），第一条 channel 可能已背着前一项任务的流量，要少摊。
+
+最后落回 3.1：`runRing` 一进来就调 `ncclCollCbdPart`，拿到本段起点 `gridOffset` 与段长 `channelCount`——3.1 那个 `offset(chunk)` 的完整版其实是 `gridOffset + elemOffset + chunkOffset`（当时为聚焦接力节奏，把 `gridOffset +` 删节掉了），外层循环的上界 `channelCount` 就是本 channel 的段长。
+
 这里需要消除一个同名歧义：第 11 篇 §2.1 的"硬件通道（channel）"是 GPU 驱动下发命令的队列通道；本篇的 channel 是 NCCL 的并行搬运通道。两者正交——NCCL kernel 作为一个任务经某条硬件通道下发，kernel 内部再按 channel 分成若干线程块。
+
+最后把一件散在各处的事收口：**一条 channel 的几件行头，建造者与使用者是分开的。**
+
+| 成分 | 谁建、何时 | 谁用、何时 | 细节在哪 |
+| --- | --- | --- | --- |
+| 连接（上家下家的地址簿） | CPU·建组时施工 | kernel·执行时读指针做 load/store | 篇 4（机内 IPC）、篇 5（跨机 QP）；本篇 2.5 节登记 |
+| 缓冲（FIFO 槽位） | CPU·建组时分配（Simple 每连接 4 MiB、8 槽循环） | kernel·执行时按槽循环写 | 4.1 节 |
+| 旗标 / 步进计数 | CPU·建组时随缓冲分配 | kernel·执行时按选中协议的格式读写 | 4.1 节 |
+| 任务单（段划分） | CPU·调用时规划 | kernel·执行时认领自己那段 | 本节 |
+
+跨机时多一个角色：**proxy 线程**（CPU 上的后台线程）——kernel 只把数据写进本机 FIFO 槽位、翻旗标，真正调 verbs 驱动网卡的是它；kernel 代码里因此一行网卡 API 都看不到。它的推进循环留给下一篇。
+
+一句话收拢：**CPU 在建组时把每条 channel 造成"能跑数据的通道"（连接 + 缓冲 + 旗标），调用时只填任务单；kernel 在执行时只是沿它收发，永不创建任何资源。**这不是偷懒而是约束：CUDA IPC、建 QP 都是系统调用，GPU 上做不了，一切重活必须在建组时一次做完——第一节"三个时机"的分工，根子在这里。
 
 ### 5.2 channel 数的两层决定
 
